@@ -245,8 +245,8 @@ class DEST3DHeadV1(nn.Module):
                 ISSMDecoderLayer(
                     self.embed_dims, issm_decoder_layers.nhead, 
                     issm_decoder_layers.dim_feedforward, issm_decoder_layers.dropout, 
-                    issm_decoder_layers.activation, num_proposal=num_proposal,
-                    use_biscan=True,
+                    issm_decoder_layers.activation, num_proposal=self.num_proposal,
+                    use_biscan=issm_decoder_layers.use_biscan,
                     last_layer=(i==self.num_decoder_layers-1)
                 ))
 

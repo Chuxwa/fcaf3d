@@ -598,15 +598,15 @@ class MultiHeadISSMScan(nn.Module):
             last_states: (B, K, D) - Final states
         """
         y, last_states = ISSM_chunk_scan_combined(
-            rearrange(x, "b l (h p) -> b l h p", p=self.headdim),
-            dt,
-            A,
-            B,
-            C,
+            rearrange(x, "b l (h p) -> b l h p", p=self.headdim).contiguous(),
+            dt.contiguous(),
+            A.contiguous(),
+            B.contiguous(),
+            C.contiguous(),
             chunk_size=self.chunk_size,
             D=self.D,
             z=None,
-            initial_states=initial_states,
+            initial_states=initial_states.contiguous(),
             **module_kwargs,
         )
         return y, last_states
