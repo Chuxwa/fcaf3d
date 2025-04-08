@@ -13,6 +13,7 @@ from .vote_head import VoteHead
 from .vote_head_v2 import VoteHeadV2
 from .fcaf3d_neck_with_head import Fcaf3DNeckWithHead, Fcaf3DAssigner
 from .groupfree3d_head_v1 import GroupFree3DHeadV1
+from .dest3d_groupfree_head import DEST3DHeadV1
 
 __all__ = [
     'Anchor3DHead', 'FreeAnchor3DHead', 'PartA2RPNHead', 'VoteHead',
