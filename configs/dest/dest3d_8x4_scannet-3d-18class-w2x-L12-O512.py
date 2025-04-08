@@ -13,9 +13,9 @@ model = dict(
         num_points=(2048, 1024, 512, 256),
         radius=(0.2, 0.4, 0.8, 1.2),
         num_samples=(64, 32, 16, 16),
-        sa_channels=((64, 64, 128), (128, 128, 256), (128, 128, 256),
-                     (128, 128, 256)),
-        fp_channels=((256, 256), (256, 288)),
+        sa_channels=((128, 128, 256), (256, 256, 512), (256, 256, 512),
+                     (256, 256, 512)),
+        fp_channels=((512, 512), (512, 288)),
         norm_cfg=dict(type='BN2d'),
         sa_cfg=dict(
             type='PointSAModule',
@@ -29,8 +29,8 @@ model = dict(
         add_var=True,
         reg_topk=4,
         in_channels=288,
-        num_decoder_layers=6,
-        num_proposal=256,
+        num_decoder_layers=12,
+        num_proposal=512,
         issm_decoder_layers=dict(
             nhead=8,
             dim_feedforward=2048,
@@ -184,7 +184,7 @@ test_pipeline = [
 ]
 
 data = dict(
-    samples_per_gpu=8,
+    samples_per_gpu=4,
     workers_per_gpu=4,
     train=dict(
         type='RepeatDataset',
