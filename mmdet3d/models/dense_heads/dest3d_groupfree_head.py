@@ -182,21 +182,6 @@ class DEST3DHeadV1(nn.Module):
         self.size_cls_agnostic = size_cls_agnostic
         self.gt_per_seed = gt_per_seed
 
-        # Transformer decoder layers
-        # if isinstance(transformerlayers, ConfigDict):
-        #     transformerlayers = [
-        #         copy.deepcopy(transformerlayers)
-        #         for _ in range(num_decoder_layers)
-        #     ]
-        # else:
-        #     assert isinstance(transformerlayers, list) and \
-        #            len(transformerlayers) == num_decoder_layers
-        # self.decoder_layers = nn.ModuleList()
-        # for i in range(self.num_decoder_layers):
-        #     self.decoder_layers.append(
-        #         build_transformer_layer(transformerlayers[i]))
-        # Transformer decoder layers
-
         # bbox_coder
         self.bbox_coder = build_bbox_coder(bbox_coder)
         self.num_sizes = self.bbox_coder.num_sizes

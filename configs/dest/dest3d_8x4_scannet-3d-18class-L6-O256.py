@@ -34,7 +34,7 @@ model = dict(
         issm_decoder_layers=dict(
             nhead=8,
             dim_feedforward=2048,
-            dropout=0.1,
+            dropout=0.3,
             activation='relu',
             use_biscan=True,
             ),
@@ -231,7 +231,6 @@ optimizer = dict(
             'bbox_head.decoder_query_proj': dict(lr_mult=0.1, decay_mult=1.0),
             'bbox_head.decoder_key_proj': dict(lr_mult=0.1, decay_mult=1.0)
         }))
-find_unused_parameters = True
 optimizer_config = dict(grad_clip=dict(max_norm=0.1, norm_type=2))
 lr_config = dict(policy='step', warmup=None, step=[280, 340])
 

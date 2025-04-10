@@ -10,6 +10,7 @@ from timm.layers import DropPath
 from typing import Optional
 from einops import rearrange, repeat
 from .issm_triton.issm_combined import ISSM_chunk_scan_combined
+from .issm_triton.issm_noY import ISSM_chunk_scan_noY
 from .issm_triton.layernorm_gated import RMSNorm as RMSNormGated
 from mmcv.cnn.bricks.transformer import MultiheadAttention
 
@@ -205,18 +206,20 @@ class ISSMDecoderLayer(nn.Module):
         self.self_attn = MultiheadAttention(
             embed_dims=d_model,
             num_heads=nhead,
-            attn_drop=0.1,
-            dropout_layer=dict(type='Dropout', drop_prob=0.1),
+            attn_drop=dropout,
+            dropout_layer=dict(type='Dropout', drop_prob=dropout),
         )
         self.norm_scan_key = nn.LayerNorm(d_model)
         self.norm_scan_query = nn.LayerNorm(d_model)
         self.spatial_dist = BoxDistFun(out_dim=16)
-        self.ISSM_scan = MultiHeadISSMScan(d_model=d_model, d_state=num_proposal, d_dist=16, chunk_size=num_proposal, nheads=nhead, ngroups=1, expand=1, use_biscan=use_biscan)
         
         if not self.last_layer:
+            self.ISSM_scan = MultiHeadISSMScan(d_model=d_model, d_state=num_proposal, d_dist=16, chunk_size=num_proposal, nheads=nhead, ngroups=1, expand=1, use_biscan=use_biscan)
             self.norm_ffn_key = nn.LayerNorm(d_model)
             self.mlp_key = RGBlock(d_model, d_model, d_model, drop=dropout, kernel_size=7, padding=3, use_dwconv=True)
             self.norm_out_key = nn.BatchNorm1d(d_model)
+        else:
+            self.ISSM_scan = MultiHeadISSMScanNoY(d_model=d_model, d_state=num_proposal, d_dist=16, chunk_size=num_proposal, nheads=nhead, ngroups=1, expand=1, use_biscan=use_biscan)
 
         self.drop_path = DropPath(dropout) if dropout > 0. else nn.Identity()
         self.norm_ffn_query = nn.LayerNorm(d_model)
@@ -284,18 +287,26 @@ class ISSMDecoderLayer(nn.Module):
         # mask, _ = self.local_mask(key_pos, query_pos)
         weights = self.local_weight(key_pos, query_pos)
         dist = self.spatial_dist(key_pos, query_pos[..., :3], query_pos[..., 3:], torch.zeros_like(query_pos[..., 0]))
-        key2, query2 = self.ISSM_scan(
-            in_key=self.with_pos_embed(key_norm, key_pos_embed), 
-            in_query=self.with_pos_embed(query_norm, query_pos_embed), 
-            dist=dist, 
-            key_xyz=key_pos, 
-            mask=weights)
+
         
         if not self.last_layer:
+            key2, query2 = self.ISSM_scan(
+                in_key=self.with_pos_embed(key_norm, key_pos_embed), 
+                in_query=self.with_pos_embed(query_norm, query_pos_embed), 
+                dist=dist, 
+                key_xyz=key_pos, 
+                mask=weights)
             key = key + self.drop_path(key2.permute(0, 2, 1))
             key_norm = self.norm_ffn_key(key.permute(0, 2, 1)).permute(0, 2, 1)
             key = key + self.drop_path(self.mlp_key(key_norm))  # FFN
             key = self.norm_out_key(key)
+        else:
+            query2 = self.ISSM_scan(
+                in_key=self.with_pos_embed(key_norm, key_pos_embed), 
+                in_query=self.with_pos_embed(query_norm, query_pos_embed), 
+                dist=dist, 
+                key_xyz=key_pos, 
+                mask=weights)
         
         query = query_norm + self.drop_path(query2)
         query_norm = self.norm_ffn_query(query).permute(0, 2, 1)
@@ -610,3 +621,172 @@ class MultiHeadISSMScan(nn.Module):
             **module_kwargs,
         )
         return y, last_states
+    
+class MultiHeadISSMScanNoY(nn.Module):
+    def __init__(
+        self,
+        d_model: int = 512,        # Input dimension
+        d_state: int = 64,         # State dimension
+        d_dist: int = 4,           # Distance encoding dimension
+        chunk_size: int = 256,     # Chunk size, must be greater than d_state
+        nheads: int = 4,           # Number of attention heads
+        ngroups: int = 1,          # Number of groups
+        expand: int = 2,           # Expansion factor
+        use_biscan: bool = True,   # Whether to use bidirectional scan
+        A_init_range=(1, 16),      # A matrix initialization range
+        dt_min: float = 0.0001,    # Minimum time step
+        dt_max: float = 0.1,       # Maximum time step
+        dt_init_floor: float = 1e-4,# Time step initialization lower bound
+        dt_limit=(0.0, float("inf")),
+        layer_idx=None,
+    ):
+        super().__init__()
+        # Basic configuration
+        self._init_basic_params(d_model, d_state, d_dist, chunk_size, 
+                              nheads, ngroups, expand, use_biscan, dt_limit, layer_idx)
+        self._init_projections() # Initialize projection layers
+        self._init_dt_params(dt_min, dt_max, dt_init_floor) # Initialize time step parameters
+        self._init_state_params(A_init_range) # Initialize state transition parameters
+        self._init_output_layers() # Initialize output layers
+
+    def _init_basic_params(self, d_model, d_state, d_dist, chunk_size, 
+                          nheads, ngroups, expand, use_biscan, dt_limit, layer_idx):
+        """Initialize basic parameters"""
+        self.d_model = d_model
+        self.d_state = d_state
+        self.d_dist = d_dist
+        self.chunk_size = chunk_size
+        self.nheads = nheads
+        self.ngroups = ngroups
+        self.expand = expand
+        self.use_biscan = use_biscan
+        self.d_inner = self.expand * self.d_model
+        self.headdim = self.d_inner // self.nheads
+        self.dt_limit = dt_limit
+        self.layer_idx = layer_idx
+
+    def _init_projections(self):
+        """Initialize input projection layers"""
+        # Projection dimensions: [z, x, bct]
+        d_in_key_proj = self.d_inner + self.ngroups + self.nheads
+        self.key_proj = nn.Linear(self.d_model, d_in_key_proj, bias=False)
+        
+        d_key_conv = self.d_inner + self.ngroups
+        self.key_conv = PointLiteConv(d_key_conv, d_key_conv)
+        if self.use_biscan:
+            self.key_conv_back = PointLiteConv(d_key_conv, d_key_conv)
+
+        self.query_proj = nn.Linear(self.d_model, self.d_inner, bias=False)
+        self.b_proj = nn.Linear(self.d_dist, self.ngroups, bias=False) 
+        self.dt_proj = nn.Linear(self.d_dist, self.nheads, bias=False)   
+    
+    def _init_dt_params(self, dt_min, dt_max, dt_init_floor):
+        """Initialize time step parameters"""
+        dt = torch.exp(
+            torch.rand(self.nheads) * (math.log(dt_max) - math.log(dt_min))
+            + math.log(dt_min)
+        )
+        dt = torch.clamp(dt, min=dt_init_floor)
+        # Inverse of softplus: https://github.com/pytorch/pytorch/issues/72759
+        inv_dt = dt + torch.log(-torch.expm1(-dt))
+        self.dt_bias = nn.Parameter(inv_dt)
+        self.dt_bias._no_weight_decay = True
+    
+    def _init_state_params(self, A_init_range):
+        """Initialize state transition parameters"""
+        assert A_init_range[0] > 0 and A_init_range[1] >= A_init_range[0]
+        A = torch.empty((self.nheads), dtype=torch.float32).uniform_(*A_init_range)
+        self.A_log = nn.Parameter(torch.log(A))
+        self.A_log._no_weight_decay = True
+    
+    def _init_output_layers(self):
+        """Initialize output layers"""
+        # Extra normalization layer right before output projection
+        assert RMSNormGated is not None
+        self.out_query_proj = nn.Linear(self.d_inner, self.d_model, bias=False)
+        self.query_norm = nn.LayerNorm(self.d_inner)
+
+    def forward(self, in_key, in_query, dist, key_xyz, mask=None):
+        """
+        Forward propagation function
+        Args:
+            in_key: (B, L, D) - Input sequence
+            in_query: (B, K, D) - Query sequence
+            dist: (B, L, K, M) - Distance matrix
+            mask: (B, L, K) - Mask matrix
+        Returns:
+            out_key: (B, L, D) - Processed key vector
+            out_query: (B, K, D) - Processed query vector
+        """
+        # 1. Projection transformation
+        xbdt = self.key_proj(in_key)
+        xb, dt_bias = torch.split(xbdt, [self.d_inner + self.ngroups, self.nheads], dim=-1)
+        xb = self.key_conv(key_xyz, xb)
+        x, b_bias = torch.split(xb, [self.d_inner, self.ngroups], dim=-1)
+        
+        if self.use_biscan:
+            xb_back = self.key_conv_back(key_xyz, xb)
+            x_back, b_bias_back = torch.split(xb_back, [self.d_inner, self.ngroups], dim=-1)
+        
+        initial_states = self.query_proj(in_query)
+        initial_states = rearrange(initial_states, "b l (h hd) -> b h hd l", hd=self.headdim)
+
+        # 2. Parameter generation
+        A = -torch.exp(self.A_log)  # (nheads) or (d_inner, d_state)
+        A = repeat(A, "h -> h d", d=self.d_state)
+        b_base = self.b_proj(dist) # adaptive bc
+        B = b_base.transpose(-1,-2) + b_bias.unsqueeze(-1)
+
+        if self.use_biscan:
+            B_back = b_base.transpose(-1,-2) + b_bias_back.unsqueeze(-1)
+        
+        dt_base = self.dt_proj(dist) # adaptive dt
+        dt = F.softplus(dt_base.transpose(-1,-2) + dt_bias.unsqueeze(-1) + self.dt_bias.reshape((1, 1, -1, 1)))  # (B, L, nheads)
+
+        if mask != None:
+            if mask.dtype == torch.float32:
+                dt = dt * mask.unsqueeze(2)
+            else:
+                dt[mask.unsqueeze(2).repeat(1, 1, self.nheads, 1)] = 0.0
+        
+        # 3. Selective scan
+        module_kwargs = {} if self.dt_limit == (0.0, float("inf")) else dict(dt_limit=self.dt_limit)
+        
+        last_states = self.scan(x, initial_states, dt, A, B, module_kwargs)
+
+        if self.use_biscan:
+            x_back = torch.flip(x_back, dims=[1])
+            dt_back = torch.flip(dt, dims=[1])
+            B_back = torch.flip(B_back, dims=[1])
+            last_states_back = self.scan(x_back, initial_states, dt_back, A, B_back, module_kwargs)
+            last_states = (last_states + last_states_back) / 2
+        
+        # 3. Output processing
+        last_states = rearrange(last_states, "b h p l -> b l (h p)")
+        last_states = self.query_norm(last_states)
+        out_query = self.out_query_proj(last_states)
+        return out_query
+
+    def scan(self, x, initial_states, dt, A, B, module_kwargs):
+        """
+        Perform unidirectional or bidirectional scan
+        Args:
+            x: (B, L, D) - Input sequence
+            initial_states: (B, K, D) - Initial states
+            dt: (B, L, nheads) - Time steps
+            A, B, C: Parameters for the scan
+            module_kwargs: Additional parameters
+        Returns: 
+            y: (B, K, D) - Output sequence
+            last_states: (B, K, D) - Final states
+        """
+        last_states = ISSM_chunk_scan_noY(
+            rearrange(x, "b l (h p) -> b l h p", p=self.headdim).contiguous(),
+            dt.contiguous(),
+            A.contiguous(),
+            B.contiguous(),
+            chunk_size=self.chunk_size,
+            initial_states=initial_states.contiguous(),
+            **module_kwargs,
+        )
+        return last_states
