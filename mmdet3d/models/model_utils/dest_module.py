@@ -153,72 +153,76 @@ class FFNBlock(nn.Module):
         return x
 
 class SideDistFun(nn.Module):
+    """A module that computes spatial distance relationships between query boxes and key points.
+    
+    Args:
+        log_scale (int): Scale factor for logarithmic distance transformation. Default: 512
+        out_dim (int): Output dimension of distance encoding. Default: 4
+        rpe_dim (int): Hidden dimension of the MLP network. Default: 128
+    """
     def __init__(
             self,
             log_scale:int = 512,
-            rpe_quant:str = 'bilinear_4_10',
             out_dim:int = 4,
             rpe_dim:int = 128,
             ):
         super().__init__()
         self.log_scale = log_scale
-        self.interp_method, max_value, num_points = rpe_quant.split('_')
-        max_value, num_points = float(max_value), int(num_points)
-        relative_coords_table = torch.stack(torch.meshgrid(
-            torch.linspace(-max_value, max_value, num_points, dtype=torch.float32),
-            torch.linspace(-max_value, max_value, num_points, dtype=torch.float32),
-            torch.linspace(-max_value, max_value, num_points, dtype=torch.float32),
-        ), dim=-1).unsqueeze(0)
-        self.register_buffer("relative_coords_table", relative_coords_table)
-        self.max_value = max_value
         self.cpb_mlps = self.build_cpb_mlp(6, rpe_dim, out_dim)
 
     def build_cpb_mlp(self, in_dim, hidden_dim, out_dim):
+        """Build MLP network for processing distance features.
+        
+        Args:
+            in_dim (int): Input dimension
+            hidden_dim (int): Hidden layer dimension
+            out_dim (int): Output dimension
+            
+        Returns:
+            nn.Sequential: MLP network
+        """
         cpb_mlp = nn.Sequential(nn.Linear(in_dim, hidden_dim, bias=True),
                                 nn.ReLU(inplace=False),
                                 nn.Linear(hidden_dim, out_dim, bias=False))
         return cpb_mlp
 
     def forward(self, key_xyz, query_xyz, query_size, query_angle):
-        """
-        计算查询点和关键点之间的空间距离关系
+        """Forward pass to compute distance encoding between query boxes and key points.
         
         Args:
-            key_xyz (torch.Tensor): 关键点坐标，形状为 (B, nP, 3)
-            query_xyz (torch.Tensor): 查询点坐标，形状为 (B, nQ, 3)
-            query_size (torch.Tensor): 查询框尺寸，形状为 (B, nQ, 3)
-            query_angle (torch.Tensor): 查询框角度，形状为 (B, nQ)
+            key_xyz (torch.Tensor): Key point coordinates of shape (B, nP, 3)
+            query_xyz (torch.Tensor): Query box center coordinates of shape (B, nQ, 3)
+            query_size (torch.Tensor): Query box dimensions of shape (B, nQ, 3)
+            query_angle (torch.Tensor): Query box rotation angles of shape (B, nQ)
             
         Returns:
-            torch.Tensor: 处理后的距离特征，形状为 (B, nQ, nP, out_dim)
+            torch.Tensor: Distance encoding features of shape (B, nQ, nP, out_dim)
         """
         B, nQ = query_xyz.shape[:2]
         nP = key_xyz.shape[1]
         
-        # 1. 获取查询框的两个侧面点
+        # 1. Get side points of query boxes
         query_corners = box_parametrization_to_sides(query_xyz, query_size, query_angle)
         
-        # 2. 计算相对位置差
-        # 将query_corners重塑为(B, 2*nQ, 3)并计算与key_xyz的差值
+        # 2. Compute relative position differences
         deltas = query_corners.reshape(B, -1, 3)[:, :, None, :] - key_xyz[:, None, :, :]
         
-        # 3. 坐标转换：从相机坐标系到激光雷达坐标系
-        deltas[..., 2] *= -1  # Z轴取反
+        # 3. Coordinate transformation: camera to LiDAR coordinate system
+        deltas[..., 2] *= -1  # Flip Z-axis
         deltas[..., [0, 1, 2]] = deltas[..., [0, 2, 1]]  # X,Y,Z -> X,-Z,Y
         
-        # 4. 应用旋转矩阵
-        R = roty_batch_tensor(query_angle.repeat((1, 2)))  # 形状: (B, 2*nQ, 3, 3)
+        # 4. Apply rotation transformation
+        R = roty_batch_tensor(query_angle.repeat((1, 2)))  # Shape: (B, 2*nQ, 3, 3)
         deltas = torch.matmul(deltas, R)
         
-        # 5. 坐标转换：从激光雷达坐标系回到相机坐标系
+        # 5. Coordinate transformation: LiDAR back to camera coordinate system
         deltas[..., 1] *= -1
         deltas[..., [0, 1, 2]] = deltas[..., [0, 2, 1]]  # X,-Z,Y -> X,Y,Z
         
-        # 6. 对数变换和归一化
+        # 6. Apply logarithmic transformation and normalization
         deltas = torch.sign(deltas) * torch.log2(torch.abs(deltas) * self.log_scale + 1.0) / np.log2(8)
-        deltas = deltas / self.max_value
         
-        # 7. 重塑张量并应用MLP
+        # 7. Reshape tensor and apply MLP for feature extraction
         deltas = deltas.reshape(B, nQ, 2, nP, 3).permute(0, 3, 1, 2, 4).reshape(B, nP, nQ, 6)
         dist = self.cpb_mlps(deltas)
         
@@ -290,7 +294,7 @@ class ISSMDecoderLayer(nn.Module):
         )
         self.norm_scan_key = nn.LayerNorm(d_model)
         self.norm_scan_query = nn.LayerNorm(d_model)
-        self.spatial_dist = SideDistFun(out_dim=16)
+        self.spatial_dist = SideDistFun(rpe_dim=64, out_dim=16)
         
         if not self.last_layer:
             self.ISSM_scan = MultiHeadISSMScan(d_model=d_model, d_state=num_proposal, d_dist=16, chunk_size=num_proposal, nheads=nhead, ngroups=1, expand=1, use_biscan=use_biscan)

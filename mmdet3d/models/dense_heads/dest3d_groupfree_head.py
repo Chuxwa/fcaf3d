@@ -143,6 +143,7 @@ class DEST3DHeadV1(nn.Module):
                  add_mean,
                  add_var,
                  in_channels,
+                 proposal_coder,
                  bbox_coder,
                  num_decoder_layers,
                  issm_decoder_layers,
@@ -164,6 +165,10 @@ class DEST3DHeadV1(nn.Module):
                  objectness_loss=None,
                  objscore_loss=None,
                  center_loss=None,
+                 dir_class_loss=None,
+                 dir_res_loss=None,
+                 size_class_loss=None,
+                 size_res_loss=None,
                  iou_loss=None,
                  surface_loss=None,
                  semantic_loss=None,
@@ -183,6 +188,7 @@ class DEST3DHeadV1(nn.Module):
         self.gt_per_seed = gt_per_seed
 
         # bbox_coder
+        self.proposal_coder = build_bbox_coder(proposal_coder)
         self.bbox_coder = build_bbox_coder(bbox_coder)
         self.num_sizes = self.bbox_coder.num_sizes
         self.num_dir_bins = self.bbox_coder.num_dir_bins
@@ -195,15 +201,10 @@ class DEST3DHeadV1(nn.Module):
         self.fp16_enabled = False
 
         # initial candidate prediction
-        self.n_reg_outs = 6 * (self.reg_max + 1)
-        self.head_reg_outs = 12
-
-        self.conv_pred = ReliableConvBboxHead(
+        self.conv_pred = BaseConvBboxHead(
             **pred_layer_cfg,
-            num_cls_out_channels=self.num_classes + 1,
-            num_bbox_out_channels=self.n_reg_outs + 3,
-            num_heading_out_channels=self.head_reg_outs,
-            reg_max=self.reg_max)
+            num_cls_out_channels=self._get_cls_out_channels(),
+            num_reg_out_channels=self._get_reg_out_channels())
 
         # query proj and key proj
         self.embed_dims = self.in_channels
@@ -236,6 +237,8 @@ class DEST3DHeadV1(nn.Module):
                 ))
 
         # Prediction Head
+        self.n_reg_outs = 6 * (self.reg_max + 1)
+        self.head_reg_outs = 12
         self.prediction_heads = nn.ModuleList()
         for i in range(self.num_decoder_layers):
             self.prediction_heads.append(
@@ -250,6 +253,10 @@ class DEST3DHeadV1(nn.Module):
         self.objectness_loss = build_loss(objectness_loss)
         self.objscore_loss = build_loss(objscore_loss)
         self.center_loss = build_loss(center_loss)
+        self.dir_res_loss = build_loss(dir_res_loss)
+        self.dir_class_loss = build_loss(dir_class_loss)
+        self.size_res_loss = build_loss(size_res_loss)
+        self.size_class_loss = build_loss(size_class_loss)
         self.semantic_loss = build_loss(semantic_loss)
         self.iou_loss = build_loss(iou_loss)
         self.surface_loss = build_loss(surface_loss)
@@ -351,18 +358,18 @@ class DEST3DHeadV1(nn.Module):
 
         prefix = 'proposal.'
         cls_predictions, reg_predictions = self.conv_pred(candidate_features)
-        decode_res = self.bbox_coder.split_pred(cls_predictions,
+        decode_res = self.proposal_coder.split_pred(cls_predictions,
                                                 reg_predictions, candidate_xyz,
                                                 prefix)
         results.update(decode_res)
-        bbox3d = results[f'{prefix}bbox_preds']
+        bbox3d = self.proposal_coder.decode(results, prefix)
+        # bbox3d = results[f'{prefix}bbox_preds']
 
         # 2. Iterative object box prediction by transformer decoder.
         base_bbox3d = bbox3d[:, :, :6].detach().clone()
 
         query = self.decoder_query_proj(candidate_features)
         key = self.decoder_key_proj(seed_features)
-        value = key
 
         # issm decoder
         key_pos = seed_xyz
@@ -465,56 +472,101 @@ class DEST3DHeadV1(nn.Module):
                 1 - objectness_targets.reshape(-1),
                 objectness_weights.reshape(-1),
                 avg_factor=batch_size)
-            
             losses[f'{prefix}objectness_loss'] = objectness_loss / num_stages
 
             # calculate center loss
-            box_loss_weights_expand = box_loss_weights.unsqueeze(-1).expand(
-                -1, -1, 3)
+            box_loss_weights_expand = box_loss_weights.unsqueeze(-1).expand(-1, -1, 3)
             center_loss = self.center_loss(
                 bbox_preds[f'{prefix}center'],
                 assigned_center_targets,
                 weight=box_loss_weights_expand)
             losses[f'{prefix}center_loss'] = center_loss / num_stages
 
-            # calculate surface loss
-            surface_weight = box_loss_weights.reshape(-1).unsqueeze(-1).repeat(1,6)
-            bbox_targets = torch.cat([assigned_center_targets, assigned_size_targets, dir_res_targets.unsqueeze(-1)], dim=-1)
-            surface_loss = self.surface_loss(
-                bbox_preds[f'{prefix}surface_pred'].reshape(-1, 6),
-                bbox_targets.reshape(-1, 7),
-                bbox_preds[f'{prefix}surface_scale'].reshape(-1, 6),
-                bbox_preds['query_points_xyz'].reshape(-1, 3),
-                bbox_preds[f'{prefix}bbox_probs'].permute(0,3,1,2).reshape(-1, 6, self.reg_max+1),
-                weight=surface_weight,
-                # reduction_override='none',
-            )
-            losses[f'{prefix}surface_loss'] = surface_loss / num_stages
+            if prefix == 'proposal.':
+                # calculate direction class loss
+                dir_class_loss = self.dir_class_loss(
+                    bbox_preds[f'{prefix}dir_class'].transpose(2, 1),
+                    dir_class_targets,
+                    weight=box_loss_weights)
+                losses[f'{prefix}dir_class_loss'] = dir_class_loss / num_stages
 
-            # calculate angle loss
-            pred_angle = bbox_preds[f'{prefix}bbox_preds'][..., -1].reshape(-1)
-            target_angle = bbox_targets[..., -1].reshape(-1)
-            pred_angle_sin = torch.sin(pred_angle)
-            pred_angle_cos = torch.cos(pred_angle)
-            target_angle_sin = torch.sin(target_angle)
-            target_angle_cos = torch.cos(target_angle)
-            angle_sin_loss = self.angle_loss(pred_angle_sin, target_angle_sin, weight=box_loss_weights.reshape(-1), reduction_override='none')
-            angle_cos_loss = self.angle_loss(pred_angle_cos, target_angle_cos, weight=box_loss_weights.reshape(-1), reduction_override='none')
-            angle_loss = angle_sin_loss + angle_cos_loss
-            angle_loss = angle_loss.sum()
-            losses[f'{prefix}angle_loss'] = angle_loss / num_stages
+                # calculate direction residual loss
+                heading_label_one_hot = size_class_targets.new_zeros(
+                    (batch_size, proposal_num, self.num_dir_bins))
+                heading_label_one_hot.scatter_(2, dir_class_targets.unsqueeze(-1),
+                                            1)
+                dir_res_norm = torch.sum(
+                    bbox_preds[f'{prefix}dir_res_norm'] * heading_label_one_hot,
+                    -1)
+                dir_res_loss = self.dir_res_loss(
+                    dir_res_norm, dir_res_targets, weight=box_loss_weights)
+                losses[f'{prefix}dir_res_loss'] = dir_res_loss / num_stages
 
-            # calculate iou loss
-            # iou_weight = box_loss_weights.reshape(-1)
-            pred_bbox = bbox_preds[f'{prefix}bbox_preds'][box_loss_weights != 0]
-            gt_bbox = bbox_targets[box_loss_weights != 0]
-            iou_loss = self.iou_loss(
-                pred_bbox,
-                gt_bbox,
-                weight=None,
-                reduction_override='mean',
-            )
-            losses[f'{prefix}iou_loss'] = iou_loss / num_stages
+                # calculate size class loss
+                size_class_loss = self.size_class_loss(
+                    bbox_preds[f'{prefix}size_class'].transpose(2, 1),
+                    size_class_targets,
+                    weight=box_loss_weights)
+                losses[
+                    f'{prefix}size_class_loss'] = size_class_loss / num_stages
+
+                # calculate size residual loss
+                one_hot_size_targets = size_class_targets.new_zeros(
+                    (batch_size, proposal_num, self.num_sizes))
+                one_hot_size_targets.scatter_(2,
+                                            size_class_targets.unsqueeze(-1),
+                                            1)
+                one_hot_size_targets_expand = one_hot_size_targets.unsqueeze(
+                    -1).expand(-1, -1, -1, 3).contiguous()
+                size_residual_norm = torch.sum(
+                    bbox_preds[f'{prefix}size_res_norm'] *
+                    one_hot_size_targets_expand, 2)
+                box_loss_weights_expand = box_loss_weights.unsqueeze(
+                    -1).expand(-1, -1, 3)
+                size_res_loss = self.size_res_loss(
+                    size_residual_norm,
+                    size_res_targets,
+                    weight=box_loss_weights_expand)
+                losses[f'{prefix}size_res_loss'] = size_res_loss / num_stages
+            else:
+                # calculate surface loss
+                surface_weight = box_loss_weights.reshape(-1).unsqueeze(-1).repeat(1,6)
+                bbox_targets = torch.cat([assigned_center_targets, assigned_size_targets, dir_res_targets.unsqueeze(-1)], dim=-1)
+                surface_loss = self.surface_loss(
+                    bbox_preds[f'{prefix}surface_pred'].reshape(-1, 6),
+                    bbox_targets.reshape(-1, 7),
+                    bbox_preds[f'{prefix}surface_scale'].reshape(-1, 6),
+                    bbox_preds['query_points_xyz'].reshape(-1, 3),
+                    bbox_preds[f'{prefix}bbox_probs'].permute(0,3,1,2).reshape(-1, 6, self.reg_max+1),
+                    weight=surface_weight,
+                    # reduction_override='none',
+                )
+                losses[f'{prefix}surface_loss'] = surface_loss / num_stages
+
+                # calculate angle loss
+                pred_angle = bbox_preds[f'{prefix}bbox_preds'][..., -1].reshape(-1)
+                target_angle = bbox_targets[..., -1].reshape(-1)
+                pred_angle_sin = torch.sin(pred_angle)
+                pred_angle_cos = torch.cos(pred_angle)
+                target_angle_sin = torch.sin(target_angle)
+                target_angle_cos = torch.cos(target_angle)
+                angle_sin_loss = self.angle_loss(pred_angle_sin, target_angle_sin, weight=box_loss_weights.reshape(-1), reduction_override='none')
+                angle_cos_loss = self.angle_loss(pred_angle_cos, target_angle_cos, weight=box_loss_weights.reshape(-1), reduction_override='none')
+                angle_loss = angle_sin_loss + angle_cos_loss
+                angle_loss = angle_loss.sum()
+                losses[f'{prefix}angle_loss'] = angle_loss / num_stages
+
+                # calculate iou loss
+                # iou_weight = box_loss_weights.reshape(-1)
+                pred_bbox = bbox_preds[f'{prefix}bbox_preds'][box_loss_weights != 0]
+                gt_bbox = bbox_targets[box_loss_weights != 0]
+                iou_loss = self.iou_loss(
+                    pred_bbox,
+                    gt_bbox,
+                    weight=None,
+                    reduction_override='mean',
+                )
+                losses[f'{prefix}iou_loss'] = iou_loss / num_stages
 
             # calculate semantic loss
             semantic_loss = self.semantic_loss(
@@ -523,9 +575,6 @@ class DEST3DHeadV1(nn.Module):
                 weight=box_loss_weights)
             losses[f'{prefix}semantic_loss'] = semantic_loss / num_stages
 
-        for k in losses.keys():
-            if torch.isnan(losses[k]):
-                print(k)
         if ret_target:
             losses['targets'] = targets
 
@@ -925,11 +974,11 @@ class DEST3DHeadV1(nn.Module):
         """
         # support multi-stage predicitons
         assert self.test_cfg['prediction_stages'] in \
-            ['last', 'all', 'last_three']
+            ['last', 'all', 'last_three', 'proposal', 's0', 's1', 's2', 's3', 's4', 's5']
 
         prefixes = list()
         if self.test_cfg['prediction_stages'] == 'last':
-            prefixes = [f'_{self.num_decoder_layers - 1}']
+            prefixes = [f's{self.num_decoder_layers - 1}.']
         elif self.test_cfg['prediction_stages'] == 'all':
             prefixes = ['proposal.'] + \
                 [f's{i}.' for i in range(self.num_decoder_layers)]
@@ -938,6 +987,8 @@ class DEST3DHeadV1(nn.Module):
                 f's{i}.' for i in range(self.num_decoder_layers -
                                         3, self.num_decoder_layers)
             ]
+        elif self.test_cfg['prediction_stages'] in ['proposal', 's0', 's1', 's2', 's3', 's4', 's5']:
+            prefixes = [f'{self.test_cfg["prediction_stages"]}.']
         else:
             raise NotImplementedError
 
