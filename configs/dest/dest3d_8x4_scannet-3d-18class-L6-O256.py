@@ -67,7 +67,7 @@ model = dict(
                         [1.1511526, 1.0546296, 0.49706793],
                         [0.47535285, 0.49249494, 0.5802117]]),
         bbox_coder=dict(
-            type='GroupFree3DBBoxCoderV1',
+            type='Dest3DBBoxCoder',
             num_sizes=18,
             reg_max=32,
             reg_topk=4,

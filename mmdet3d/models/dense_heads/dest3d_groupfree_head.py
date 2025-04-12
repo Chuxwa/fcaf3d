@@ -245,7 +245,7 @@ class DEST3DHeadV1(nn.Module):
                 ReliableConvBboxHead(
                 **pred_layer_cfg,
                 num_cls_out_channels=self.num_classes + 1,
-                num_bbox_out_channels=self.n_reg_outs + 3,
+                num_bbox_out_channels=self.n_reg_outs,
                 num_heading_out_channels=self.head_reg_outs,
                 reg_max=self.reg_max))
 
@@ -380,6 +380,8 @@ class DEST3DHeadV1(nn.Module):
 
             # Position Embedding
             query_pos = base_bbox3d
+            candidate_xyz = base_bbox3d[:, :, :3]
+            candidate_size = base_bbox3d[:, :, 3:6]
             
             # Issm Decoder Layer
             key_pos_seri = self.serialization_key.reorder_points(key_pos, id=i)
@@ -393,9 +395,9 @@ class DEST3DHeadV1(nn.Module):
             results[f'{prefix}query'] = query
 
             cls_predictions, reg_predictions = self.prediction_heads[i](query)
-            decode_res = self.bbox_coder.split_pred(cls_predictions,
-                                                    reg_predictions,
-                                                    candidate_xyz, prefix)
+            decode_res = self.bbox_coder.split_pred(cls_predictions, reg_predictions,
+                                                    candidate_xyz, candidate_size, 
+                                                    prefix)
             # TODO: should save bbox3d instead of decode_res?
             results.update(decode_res)
             bbox3d = results[f'{prefix}bbox_preds']
