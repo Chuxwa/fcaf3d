@@ -178,7 +178,7 @@ class Dest3DBBoxCoder(PartialBinBasedBBoxCoder):
                  reg_topk,
                  sizes=[3.0,3.0,2.5],
                  with_rot=True,
-                 size_cls_agnostic=True):
+                 version='v1'):
         super(Dest3DBBoxCoder, self).__init__(
             num_dir_bins=num_dir_bins,
             num_sizes=num_sizes,
@@ -189,9 +189,13 @@ class Dest3DBBoxCoder(PartialBinBasedBBoxCoder):
         self.sizes = sizes
         self.head_reg_outs = 12
         self.n_reg_outs = 6 * (self.reg_max + 1)
-        self.size_cls_agnostic = size_cls_agnostic
-        self.integral = SideIntegral(self.reg_max)
-        self.angle_integral = AngleIntegral(self.head_reg_outs - 1)
+        self.version = version
+        if self.version == 'v1':
+            self.integral = Integral(self.reg_max)
+            self.angle_integral = AngleIntegral(self.head_reg_outs - 1)
+        elif self.version == 'v2':
+            self.integral = SideIntegral(self.reg_max)
+            self.angle_integral = AngleIntegral(self.head_reg_outs - 1)
 
     def encode(self, gt_bboxes_3d, gt_labels_3d):
         """Encode ground truth to prediction targets.
@@ -246,19 +250,40 @@ class Dest3DBBoxCoder(PartialBinBasedBBoxCoder):
         B, proposal_num = reg_preds_trans.shape[:2]
 
         surface_pred_res = self.integral(reg_preds_trans[..., :self.n_reg_outs]).reshape(B, proposal_num, -1)
-        scales = base_size.detach().clamp_(min=1e-4)
-        scale_x, scale_y, scale_z = scales[..., 0], scales[..., 1], scales[..., 2]
-        x1 = base_xyz[..., 0] - base_size[..., 0]/2 + surface_pred_res[..., 0] * scale_x
-        y1 = base_xyz[..., 1] - base_size[..., 1]/2 + surface_pred_res[..., 1] * scale_y
-        z1 = base_xyz[..., 2] - base_size[..., 2]/2 + surface_pred_res[..., 2] * scale_z
-        x2 = base_xyz[..., 0] + base_size[..., 0]/2 + surface_pred_res[..., 3] * scale_x
-        y2 = base_xyz[..., 1] + base_size[..., 1]/2 + surface_pred_res[..., 4] * scale_y
-        z2 = base_xyz[..., 2] + base_size[..., 2]/2 + surface_pred_res[..., 5] * scale_z
-        results[f'{prefix}surface_pred'] = torch.stack((x1, y1, z1, x2, y2, z2), dim=-1).contiguous()
-        results[f'{prefix}surface_scale'] = torch.stack((scale_x, scale_y, scale_z, scale_x, scale_y, scale_z), dim=-1).contiguous()
-        
-        angles = self.angle_integral(reg_preds_trans[..., self.n_reg_outs:]).reshape(B, proposal_num) * 2 * torch.pi
-        angles[angles > torch.pi] -= 2 * torch.pi
+        if self.version == 'v1':
+            scale_x = torch.exp(reg_preds_trans[..., self.n_reg_outs + 0])
+            scale_y = torch.exp(reg_preds_trans[..., self.n_reg_outs + 1])
+            scale_z = torch.exp(reg_preds_trans[..., self.n_reg_outs + 2])
+            # scale_x = torch.ones_like(reg_preds_trans[..., self.n_reg_outs + 0]) * torch.tensor(self.sizes[0])
+            # scale_y = torch.ones_like(reg_preds_trans[..., self.n_reg_outs + 0]) * torch.tensor(self.sizes[1])
+            # scale_z = torch.ones_like(reg_preds_trans[..., self.n_reg_outs + 0]) * torch.tensor(self.sizes[2])
+            x1 = base_xyz[..., 0] - surface_pred_res[..., 0] * scale_x     
+            y1 = base_xyz[..., 1] - surface_pred_res[..., 1] * scale_y
+            z1 = base_xyz[..., 2] - surface_pred_res[..., 2] * scale_z
+            x2 = base_xyz[..., 0] + surface_pred_res[..., 3] * scale_x
+            y2 = base_xyz[..., 1] + surface_pred_res[..., 4] * scale_y
+            z2 = base_xyz[..., 2] + surface_pred_res[..., 5] * scale_z
+            results[f'{prefix}surface_pred'] = torch.stack((x1, y1, z1, x2, y2, z2), dim=-1).contiguous()
+            results[f'{prefix}surface_scale'] = torch.stack((scale_x, scale_y, scale_z, scale_x, scale_y, scale_z), dim=-1).contiguous()
+            
+            angles = self.angle_integral(reg_preds_trans[..., self.n_reg_outs + 3:]).reshape(B, proposal_num) * 2 * torch.pi
+            angles[angles > torch.pi] -= 2 * torch.pi
+
+        elif self.version == 'v2':
+            scales = base_size.detach().clamp_(min=1e-4)
+            scale_x, scale_y, scale_z = scales[..., 0], scales[..., 1], scales[..., 2]
+            x1 = base_xyz[..., 0] - base_size[..., 0]/2 + surface_pred_res[..., 0] * scale_x
+            y1 = base_xyz[..., 1] - base_size[..., 1]/2 + surface_pred_res[..., 1] * scale_y
+            z1 = base_xyz[..., 2] - base_size[..., 2]/2 + surface_pred_res[..., 2] * scale_z
+            x2 = base_xyz[..., 0] + base_size[..., 0]/2 + surface_pred_res[..., 3] * scale_x
+            y2 = base_xyz[..., 1] + base_size[..., 1]/2 + surface_pred_res[..., 4] * scale_y
+            z2 = base_xyz[..., 2] + base_size[..., 2]/2 + surface_pred_res[..., 5] * scale_z
+
+            results[f'{prefix}surface_pred'] = torch.stack((x1, y1, z1, x2, y2, z2), dim=-1).contiguous()
+            results[f'{prefix}surface_scale'] = torch.stack((scale_x, scale_y, scale_z, scale_x, scale_y, scale_z), dim=-1).contiguous()
+            
+            angles = self.angle_integral(reg_preds_trans[..., self.n_reg_outs:]).reshape(B, proposal_num) * 2 * torch.pi
+            angles[angles > torch.pi] -= 2 * torch.pi
 
         results[f'{prefix}bbox_preds'] = torch.stack((
             (x1 + x2)/2.0,
