@@ -4,7 +4,7 @@ import torch.nn as nn
 from torch.nn import functional as F
 
 from mmdet.core.bbox.builder import BBOX_CODERS
-from .partial_bin_based_bbox_coder import PartialBinBasedBBoxCoder
+from .partial_bin_based_bbox_coder import BaseBBoxCoder
 
 class Integral(nn.Module):
     """A fixed layer for calculating integral result from distribution.
@@ -158,7 +158,7 @@ class AngleIntegral(nn.Module):
 
 
 @BBOX_CODERS.register_module()
-class Dest3DBBoxCoder(PartialBinBasedBBoxCoder):
+class Dest3DBBoxCoder(BaseBBoxCoder):
     """Modified partial bin based bbox coder for GroupFree3D.
 
     Args:
@@ -171,19 +171,13 @@ class Dest3DBBoxCoder(PartialBinBasedBBoxCoder):
     """
 
     def __init__(self,
-                 num_dir_bins,
-                 num_sizes,
-                 mean_sizes,
                  reg_max,
                  reg_topk,
                  sizes=[3.0,3.0,2.5],
                  with_rot=True,
                  version='v1'):
-        super(Dest3DBBoxCoder, self).__init__(
-            num_dir_bins=num_dir_bins,
-            num_sizes=num_sizes,
-            mean_sizes=mean_sizes,
-            with_rot=with_rot)
+        super(Dest3DBBoxCoder, self).__init__()
+        self.with_rot = with_rot
         self.reg_max = reg_max
         self.reg_topk = reg_topk
         self.sizes = sizes
@@ -196,38 +190,6 @@ class Dest3DBBoxCoder(PartialBinBasedBBoxCoder):
         elif self.version == 'v2':
             self.integral = SideIntegral(self.reg_max)
             self.angle_integral = AngleIntegral(self.head_reg_outs - 1)
-
-    def encode(self, gt_bboxes_3d, gt_labels_3d):
-        """Encode ground truth to prediction targets.
-
-        Args:
-            gt_bboxes_3d (BaseInstance3DBoxes): Ground truth bboxes \
-                with shape (n, 7).
-            gt_labels_3d (torch.Tensor): Ground truth classes.
-
-        Returns:
-            tuple: Targets of center, size and direction.
-        """
-        # generate center target
-        center_target = gt_bboxes_3d.gravity_center
-
-        # generate bbox size target
-        size_target = gt_bboxes_3d.dims
-        size_class_target = gt_labels_3d.to(torch.int64)
-        size_res_target = gt_bboxes_3d.dims - gt_bboxes_3d.tensor.new_tensor(
-            self.mean_sizes)[size_class_target]
-
-        # generate dir target
-        box_num = gt_labels_3d.shape[0]
-        if self.with_rot:
-            (dir_class_target,
-             dir_res_target) = self.angle2class(gt_bboxes_3d.yaw)
-        else:
-            dir_class_target = gt_labels_3d.new_zeros(box_num)
-            dir_res_target = gt_bboxes_3d.tensor.new_zeros(box_num)
-
-        return (center_target, size_target, size_class_target, size_res_target,
-                dir_class_target, dir_res_target)
 
     def split_pred(self, cls_preds, reg_preds, base_xyz, base_size, prefix=''):
         """Split predicted features to specific parts.
@@ -309,3 +271,77 @@ class Dest3DBBoxCoder(PartialBinBasedBBoxCoder):
         results[f'{prefix}sem_scores'] = cls_preds_trans[..., 1:].contiguous()
 
         return results
+    
+    def encode(self, gt_bboxes_3d, gt_labels_3d):
+        """Encode ground truth to prediction targets.
+
+        Args:
+            gt_bboxes_3d (BaseInstance3DBoxes): Ground truth bboxes \
+                with shape (n, 7).
+            gt_labels_3d (torch.Tensor): Ground truth classes.
+
+        Returns:
+            tuple: Targets of center, size and direction.
+        """
+        # generate center target
+        center_target = gt_bboxes_3d.gravity_center
+
+        # generate bbox size target
+        size_class_target = gt_labels_3d
+        size_res_target = gt_bboxes_3d.dims - gt_bboxes_3d.tensor.new_tensor(
+            self.mean_sizes)[size_class_target]
+
+        # generate dir target
+        box_num = gt_labels_3d.shape[0]
+        if self.with_rot:
+            (dir_class_target,
+             dir_res_target) = self.angle2class(gt_bboxes_3d.yaw)
+        else:
+            dir_class_target = gt_labels_3d.new_zeros(box_num)
+            dir_res_target = gt_bboxes_3d.tensor.new_zeros(box_num)
+
+        return (center_target, size_class_target, size_res_target,
+                dir_class_target, dir_res_target)
+
+    def decode(self, bbox_out, suffix=''):
+        """Decode predicted parts to bbox3d.
+
+        Args:
+            bbox_out (dict): Predictions from model, should contain keys below.
+
+                - center: predicted bottom center of bboxes.
+                - dir_class: predicted bbox direction class.
+                - dir_res: predicted bbox direction residual.
+                - size_class: predicted bbox size class.
+                - size_res: predicted bbox size residual.
+            suffix (str): Decode predictions with specific suffix.
+
+        Returns:
+            torch.Tensor: Decoded bbox3d with shape (batch, n, 7).
+        """
+        center = bbox_out['center' + suffix]
+        batch_size, num_proposal = center.shape[:2]
+
+        # decode heading angle
+        if self.with_rot:
+            dir_class = torch.argmax(bbox_out['dir_class' + suffix], -1)
+            dir_res = torch.gather(bbox_out['dir_res' + suffix], 2,
+                                   dir_class.unsqueeze(-1))
+            dir_res.squeeze_(2)
+            dir_angle = self.class2angle(dir_class, dir_res).reshape(
+                batch_size, num_proposal, 1)
+        else:
+            dir_angle = center.new_zeros(batch_size, num_proposal, 1)
+
+        # decode bbox size
+        size_class = torch.argmax(
+            bbox_out['size_class' + suffix], -1, keepdim=True)
+        size_res = torch.gather(bbox_out['size_res' + suffix], 2,
+                                size_class.unsqueeze(-1).repeat(1, 1, 1, 3))
+        mean_sizes = center.new_tensor(self.mean_sizes)
+        size_base = torch.index_select(mean_sizes, 0, size_class.reshape(-1))
+        bbox_size = size_base.reshape(batch_size, num_proposal,
+                                      -1) + size_res.squeeze(2)
+
+        bbox3d = torch.cat([center, bbox_size, dir_angle], dim=-1)
+        return bbox3d

@@ -149,7 +149,7 @@ class DEST3DHeadV1(nn.Module):
                  issm_decoder_layers,
                  decoder_self_posembeds=dict(
                      type='ConvBNPositionalEncoding',
-                     input_channel=6,
+                     input_channel=12,
                      num_pos_feats=288),
                  decoder_issm_posembeds=dict(
                      type='ConvBNPositionalEncoding',
@@ -190,8 +190,8 @@ class DEST3DHeadV1(nn.Module):
         # bbox_coder
         self.proposal_coder = build_bbox_coder(proposal_coder)
         self.bbox_coder = build_bbox_coder(bbox_coder)
-        self.num_sizes = self.bbox_coder.num_sizes
-        self.num_dir_bins = self.bbox_coder.num_dir_bins
+        self.num_sizes = self.proposal_coder.num_sizes
+        self.num_dir_bins = self.proposal_coder.num_dir_bins
 
         # Initial object candidate sampling
         self.gsample_module = GeneralSamplingModule()
@@ -245,7 +245,7 @@ class DEST3DHeadV1(nn.Module):
                 ReliableConvBboxHead(
                 **pred_layer_cfg,
                 num_cls_out_channels=self.num_classes + 1,
-                num_bbox_out_channels=self.n_reg_outs,
+                num_bbox_out_channels=self.n_reg_outs + 3 if self.bbox_coder.version == 'v1' else self.n_reg_outs,
                 num_heading_out_channels=self.head_reg_outs,
                 reg_max=self.reg_max))
 
@@ -379,8 +379,9 @@ class DEST3DHeadV1(nn.Module):
             prefix = f's{i}.'
 
             # Position Embedding
-            query_pos = base_bbox3d
-            candidate_xyz = base_bbox3d[:, :, :3]
+            # query_pos = base_bbox3d
+            query_pos = torch.cat((base_bbox3d, Bbox2Surface(base_bbox3d)), dim=-1)
+            # candidate_xyz = base_bbox3d[:, :, :3]
             candidate_size = base_bbox3d[:, :, 3:6]
             
             # Issm Decoder Layer
@@ -724,14 +725,14 @@ class DEST3DHeadV1(nn.Module):
             tuple[torch.Tensor]: Targets of GroupFree3D head.
         """
 
-        # assert self.bbox_coder.with_rot or pts_semantic_mask is not None
+        # assert self.proposal_coder.with_rot or pts_semantic_mask is not None
 
         gt_bboxes_3d = gt_bboxes_3d.to(points.device)
 
         # generate center, dir, size target
         (center_targets, size_targets, size_class_targets, size_res_targets,
          dir_class_targets,
-         dir_res_targets) = self.bbox_coder.encode(gt_bboxes_3d, gt_labels_3d)
+         dir_res_targets) = self.proposal_coder.encode(gt_bboxes_3d, gt_labels_3d)
 
         # pad targets as original code of GroupFree3D
         pad_num = max_gt_nums - gt_labels_3d.shape[0]
@@ -757,7 +758,7 @@ class DEST3DHeadV1(nn.Module):
         pts_instance_label = points.new_zeros([num_points],
                                               dtype=torch.long) - 1
 
-        if self.bbox_coder.with_rot:
+        if self.proposal_coder.with_rot:
             vote_targets = points.new_zeros([num_points, 4 * self.gt_per_seed])
             vote_target_idx = points.new_zeros([num_points], dtype=torch.long)
             box_indices_all = gt_bboxes_3d.points_in_boxes(points)
@@ -941,7 +942,7 @@ class DEST3DHeadV1(nn.Module):
         one_hot_size_targets = one_hot_size_targets.unsqueeze(-1).expand(
             -1, -1, 3)  # (num_candidate,num_size_cluster,3)
         mean_sizes = size_res_targets.new_tensor(
-            self.bbox_coder.mean_sizes).unsqueeze(0)
+            self.proposal_coder.mean_sizes).unsqueeze(0)
         pos_mean_sizes = torch.sum(one_hot_size_targets * mean_sizes, 1)
         size_res_targets /= pos_mean_sizes
 
@@ -1007,7 +1008,7 @@ class DEST3DHeadV1(nn.Module):
                 iou_logits = bbox_preds[f'{prefix}iou_scores'].reshape(-1, self.num_classes)
                 iou_logits = torch.stack([iou_logits[i,indx[i]] for i in range(B*num_proposal)]).reshape(B, -1)
                 obj_score = obj_score * iou_logits
-            # bbox = self.bbox_coder.decode(bbox_preds, prefix)
+            # bbox = self.proposal_coder.decode(bbox_preds, prefix)
             bbox = bbox_preds[f"{prefix}bbox_preds"]
             bbox[..., -1] = 0.0
             obj_scores.append(obj_score)
@@ -1029,7 +1030,7 @@ class DEST3DHeadV1(nn.Module):
                 bbox = input_metas[b]['box_type_3d'](
                     bbox_selected,
                     box_dim=bbox_selected.shape[-1],
-                    with_yaw=self.bbox_coder.with_rot)
+                    with_yaw=self.proposal_coder.with_rot)
                 results.append((bbox, score_selected, labels))
 
             return results
@@ -1053,7 +1054,7 @@ class DEST3DHeadV1(nn.Module):
         bbox = input_meta['box_type_3d'](
             bbox,
             box_dim=bbox.shape[-1],
-            with_yaw=self.bbox_coder.with_rot,
+            with_yaw=self.proposal_coder.with_rot,
             origin=(0.5, 0.5, 0.5))
         box_indices = bbox.points_in_boxes(points)
 
