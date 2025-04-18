@@ -1,7 +1,11 @@
 import torch
-
+import numpy as np
 from . import roiaware_pool3d_ext
 
+def check_numpy_to_torch(x):
+    if isinstance(x, np.ndarray):
+        return torch.from_numpy(x).float(), True
+    return x, False
 
 def points_in_boxes_gpu(points, boxes):
     """Find points that are in boxes (CUDA)
@@ -72,6 +76,8 @@ def points_in_boxes_cpu(points, boxes):
     assert points.shape[1] == 3, \
         f'points dimension should be 3, ' \
         f'got unexpected shape {points.shape[2]}'
+    points, is_numpy = check_numpy_to_torch(points)
+    boxes, is_numpy = check_numpy_to_torch(boxes)
 
     point_indices = points.new_zeros((boxes.shape[0], points.shape[0]),
                                      dtype=torch.int)
@@ -79,7 +85,7 @@ def points_in_boxes_cpu(points, boxes):
                                             points.float().contiguous(),
                                             point_indices)
 
-    return point_indices
+    return point_indices.numpy() if is_numpy else point_indices
 
 
 def points_in_boxes_batch(points, boxes):
