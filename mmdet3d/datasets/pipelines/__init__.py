@@ -1,5 +1,6 @@
 from mmdet.datasets.pipelines import Compose
 from .dbsampler import DataBaseSampler
+from .gtsampler import GTSampler
 from .formating import Collect3D, DefaultFormatBundle, DefaultFormatBundle3D
 from .loading import (LoadAnnotations3D, LoadImageFromFileMono3D,
                       LoadMultiViewImageFromFiles, LoadPointsFromFile,
@@ -23,5 +24,5 @@ __all__ = [
     'PointSegClassMapping', 'MultiScaleFlipAug3D', 'LoadPointsFromMultiSweeps',
     'BackgroundPointsFilter', 'VoxelBasedPointSampler', 'GlobalAlignment',
     'IndoorPatchPointSample', 'LoadImageFromFileMono3D', 'ObjectNameFilter',
-    'RandomDropPointsColor', 'RandomJitterPoints'
+    'RandomDropPointsColor', 'RandomJitterPoints', 'GTSampler'
 ]
