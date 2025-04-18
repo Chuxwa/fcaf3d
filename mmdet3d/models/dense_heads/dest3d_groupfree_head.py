@@ -149,7 +149,7 @@ class DEST3DHeadV1(nn.Module):
                  issm_decoder_layers,
                  decoder_self_posembeds=dict(
                      type='ConvBNPositionalEncoding',
-                     input_channel=12,
+                     input_channel=9,
                      num_pos_feats=288),
                  decoder_issm_posembeds=dict(
                      type='ConvBNPositionalEncoding',
@@ -380,7 +380,7 @@ class DEST3DHeadV1(nn.Module):
 
             # Position Embedding
             # query_pos = base_bbox3d
-            query_pos = torch.cat((base_bbox3d, Bbox2Surface(base_bbox3d)), dim=-1)
+            query_pos = torch.cat((base_bbox3d[:, :, :3], Bbox2Surface(base_bbox3d)[:, :, :6]), dim=-1)
             # candidate_xyz = base_bbox3d[:, :, :3]
             candidate_size = base_bbox3d[:, :, 3:6]
             
