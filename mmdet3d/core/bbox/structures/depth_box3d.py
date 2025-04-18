@@ -48,6 +48,14 @@ class DepthInstance3DBoxes(BaseInstance3DBoxes):
         return gravity_center
 
     @property
+    def gravity_box(self):
+        """torch.Tensor: (x, y, z, x_size, y_size, z_size, yaw) of each box."""
+        gravity_box = torch.zeros_like(self.tensor)
+        gravity_box[:, :3] = self.gravity_center
+        gravity_box[:, 3:] = self.tensor[:, 3:]
+        return gravity_box
+
+    @property
     def corners(self):
         """torch.Tensor: Coordinates of corners of all the boxes
         in shape (N, 8, 3).
