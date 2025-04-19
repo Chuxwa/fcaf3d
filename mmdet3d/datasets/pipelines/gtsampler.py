@@ -2,6 +2,7 @@ import os
 import torch
 import numpy as np
 import pickle as pkl
+import time
 
 from mmdet.datasets.builder import PIPELINES
 from mmdet3d.ops.pcdet_nms import pcdet_nms_utils
@@ -23,8 +24,13 @@ class GTSampler(object):
             self.gt_base = pkl.load(open(self.gt_base_filename, 'rb'))
         else:
             print(f'{self.gt_base_filename} does not exist')
-            # raise FileNotFoundError(f'{gt_base_filename} does not exist')
             self.gt_base = None
+
+        self.base_bboxes = torch.from_numpy(self.gt_base['instance_bboxes']).to(torch.float32)
+        self.base_raw_pc = self.gt_base['raw_points_in_boxes']
+        self.base_labels = self.gt_base['instance_labels']
+        self.base_semantics = self.gt_base['instance_semantics']
+        self.iou2 = pcdet_nms_utils.boxes_bev_iou_cpu(self.base_bboxes, self.base_bboxes).numpy()
 
     def __call__(self, results):
         if self.gt_base is None:
@@ -34,28 +40,21 @@ class GTSampler(object):
     
     def sample_from_base(self, results):
         '''
-        @input results: {'points': (#points, 3+Color), 'gt_bboxes_3d': (N, 7), 'instance_labels': (#points), 'semantic_labels': (#points)}
         '''
-        base_bboxes = torch.from_numpy(self.gt_base['instance_bboxes']).to(torch.float32)
-        base_raw_pc = self.gt_base['raw_points_in_boxes']
-        base_labels = self.gt_base['instance_labels']
-        base_semantics = self.gt_base['instance_semantics']
-
         input_pc = results['points']
         input_bbox = results['gt_bboxes_3d'].tensor
         input_labels = results['gt_labels_3d']
         input_instance_labels = results['pts_instance_mask']
         input_semantic_labels = results['pts_semantic_mask']
 
-        iou1 = pcdet_nms_utils.boxes_bev_iou_cpu(base_bboxes, input_bbox).numpy()
-        iou2 = pcdet_nms_utils.boxes_bev_iou_cpu(base_bboxes, base_bboxes).numpy()
-        iou2[range(iou2.shape[0]), range(iou2.shape[0])] = 0
+        iou1 = pcdet_nms_utils.boxes_bev_iou_cpu(self.base_bboxes, input_bbox).numpy()
+        self.iou2[range(self.iou2.shape[0]), range(self.iou2.shape[0])] = 0
         if iou1.shape[1] > 0:
             iou1_mask = (np.max(iou1, axis=1) == 0)
-            iou2_mask = (np.max(iou2, axis=1) < self.sample_iou_threshold)
+            iou2_mask = (np.max(self.iou2, axis=1) < self.sample_iou_threshold)
             mask_final = np.logical_and(iou1_mask, iou2_mask)
         else:
-            iou2_mask = (np.max(iou2, axis=1) < self.sample_iou_threshold)
+            iou2_mask = (np.max(self.iou2, axis=1) < self.sample_iou_threshold)
             mask_final = iou2_mask
 
         indexes_final = np.where(mask_final)[0]
@@ -72,12 +71,12 @@ class GTSampler(object):
         res_semantic_labels = input_semantic_labels
         res_labels = input_labels
         for indx in indexes_final:
-            res_point_clouds = np.concatenate([res_point_clouds, base_raw_pc[indx][:, :res_point_clouds.shape[1]]], axis=0)
-            res_bboxes = np.concatenate([res_bboxes, base_bboxes[indx][np.newaxis, ...]], axis=0)
-            tem_array = np.ones(base_raw_pc[indx].shape[0])
+            res_point_clouds = np.concatenate([res_point_clouds, self.base_raw_pc[indx][:, :res_point_clouds.shape[1]]], axis=0)
+            res_bboxes = np.concatenate([res_bboxes, self.base_bboxes[indx][np.newaxis, ...]], axis=0)
+            tem_array = np.ones(self.base_raw_pc[indx].shape[0])
             res_instance_labels = np.concatenate([res_instance_labels, tem_array * np.max(res_instance_labels + 1)])
-            res_semantic_labels = np.concatenate([res_semantic_labels, tem_array * base_semantics[indx]])
-            res_labels = np.concatenate([res_labels, np.array([base_labels[indx]])], axis=0)
+            res_semantic_labels = np.concatenate([res_semantic_labels, tem_array * self.base_semantics[indx]])
+            res_labels = np.concatenate([res_labels, np.array([self.base_labels[indx]])], axis=0)
         
         results['points'].tensor = torch.from_numpy(res_point_clouds)
         results['gt_bboxes_3d'].tensor = torch.from_numpy(res_bboxes)
