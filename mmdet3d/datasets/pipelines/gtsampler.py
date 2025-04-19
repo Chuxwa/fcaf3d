@@ -1,4 +1,5 @@
 import os
+import random
 import torch
 import numpy as np
 import pickle as pkl
@@ -11,7 +12,7 @@ from mmdet3d.ops.pcdet_nms import pcdet_nms_utils
 class GTSampler(object):
 
     def __init__(self, using_instance_segmentation=False, data_root=None):
-        self.sample_num = 10
+        self.sample_num_max = 15
         self.sample_iou_threshold = 0.2
         self.using_instance_segmentation = using_instance_segmentation
         self.data_root = data_root
@@ -58,12 +59,13 @@ class GTSampler(object):
             mask_final = iou2_mask
 
         indexes_final = np.where(mask_final)[0]
-        if len(indexes_final) == 0:
+        sample_num = random.randint(0, self.sample_num_max)
+        if len(indexes_final) == 0 or sample_num == 0:
             return results
-        elif len(indexes_final) < self.sample_num:
+        elif len(indexes_final) < sample_num:
             pass
         else:
-            indexes_final = np.random.choice(indexes_final, (self.sample_num), replace=False)
+            indexes_final = np.random.choice(indexes_final, (sample_num), replace=False)
         
         res_point_clouds = input_pc.tensor.numpy()
         res_bboxes = input_bbox.numpy()
